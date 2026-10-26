@@ -1,0 +1,461 @@
+<script>
+/* Kasirku UI — interaksi dan tampilan dipisah dari backend Code.gs. */
+(() => {
+  'use strict';
+
+  const state = { products: [], cart: [], chart: null, reportChart: null, productPie: null, paymentPie: null, reportPie: null, page: 'dashboard', token: localStorage.getItem('kasirku-token') || sessionStorage.getItem('kasirku-token') || '', user: null };
+  const $ = selector => document.querySelector(selector);
+  const rupiah = value => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(Number(value || 0));
+  const escapeHtml = value => String(value == null ? '' : value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+  const icons = ['bi-cup-hot', 'bi-basket2', 'bi-cup-straw', 'bi-egg-fried', 'bi-cake2', 'bi-bag-heart'];
+  const productIcon = index => icons[index % icons.length];
+  const callServer = (name, args = []) => new Promise((resolve, reject) => {
+    if (!window.google || !google.script || !google.script.run) {
+      reject(new Error('Buka aplikasi melalui deployment Google Apps Script untuk mengakses database.'));
+      return;
+    }
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(error => reject(new Error(error.message || String(error))))[name](...args);
+  });
+  const run = (name, ...args) => callServer(name, [state.token, ...args]);
+
+  function toast(message, isError = false) {
+    const box = $('#toast'); box.textContent = message; box.classList.toggle('error', isError); box.classList.add('show');
+    clearTimeout(toast.timer); toast.timer = setTimeout(() => box.classList.remove('show'), 3300);
+  }
+
+  function setBusy(button, busy, label) {
+    if (!button) return;
+    button.disabled = busy;
+    if (busy) { button.dataset.original = button.innerHTML; button.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Memproses...'; }
+    else if (button.dataset.original) { button.innerHTML = button.dataset.original; delete button.dataset.original; }
+    if (label) button.setAttribute('aria-label', label);
+  }
+
+  function dateLabel() {
+    const date = new Date();
+    $('#todayLabel').textContent = new Intl.DateTimeFormat('id-ID', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }).format(date);
+    $('#page-dashboard .eyebrow').textContent = new Intl.DateTimeFormat('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(date).toUpperCase();
+    $('#posClock').textContent = new Intl.DateTimeFormat('id-ID', { hour: '2-digit', minute: '2-digit' }).format(date);
+  }
+
+  async function initialize() {
+    dateLabel(); setInterval(() => { $('#posClock').textContent = new Intl.DateTimeFormat('id-ID', { hour: '2-digit', minute: '2-digit' }).format(new Date()); }, 30000);
+    bindEvents();
+    $('#loginForm').addEventListener('submit', handleLogin);
+    $('#rememberMe').checked = Boolean(localStorage.getItem('kasirku-token'));
+    $('#toggleLoginPassword').addEventListener('click', toggleLoginPassword);
+    if (state.token) {
+      try { const response = await run('heartbeat'); state.user = response.user; await enterApplication(); }
+      catch (error) { clearAuth(); }
+    }
+    window.setInterval(async () => {
+      if (!state.token) return;
+      try {
+        const oldRole = state.user && state.user.role;
+        const response = await run('heartbeat'); state.user = response.user;
+        if (oldRole && oldRole !== state.user.role) { clearAuth(); toast('Role akun berubah. Silakan masuk kembali.', true); return; }
+        sessionStorage.setItem('kasirku-user', JSON.stringify(state.user));
+        if (state.user.role === 'admin' && state.page === 'dashboard') {
+          const data = await run('getDashboardData', $('#dashboardPeriod').value);
+          renderAdminOverview(data.admin);
+        }
+        if (state.user.role === 'admin' && state.page === 'monitor') await loadMonitor();
+      }
+      catch (error) { clearAuth(); toast('Sesi berakhir. Silakan login kembali.', true); }
+    }, 3 * 60 * 1000);
+  }
+
+  async function handleLogin(event) {
+    event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('[type="submit"]');
+    $('#loginError').textContent = ''; setBusy(button, true);
+    try {
+      const result = await callServer('login', [form.elements.username.value, form.elements.password.value]);
+      state.token = result.token; state.user = result.user;
+      localStorage.removeItem('kasirku-token'); sessionStorage.removeItem('kasirku-token');
+      (form.elements.rememberMe.checked ? localStorage : sessionStorage).setItem('kasirku-token', state.token);
+      sessionStorage.setItem('kasirku-user', JSON.stringify(state.user)); form.reset(); await enterApplication();
+    } catch (error) { $('#loginError').textContent = error.message; }
+    finally { setBusy(button, false); }
+  }
+
+  async function enterApplication() {
+    if (!state.user) state.user = JSON.parse(sessionStorage.getItem('kasirku-user') || 'null');
+    document.body.classList.add('authenticated'); document.body.classList.toggle('role-admin', state.user && state.user.role === 'admin');
+    $('#roleChip').textContent = state.user ? state.user.role : '';
+    $('#page-dashboard .page-heading h1').innerHTML = 'Selamat datang, ' + escapeHtml(state.user.name) + ' <span>☀️</span>';
+    document.querySelectorAll('[data-go="reports"]').forEach(button => { button.hidden = state.user.role !== 'admin'; });
+    $('#topAvatar').textContent = state.user ? state.user.name.slice(0, 1).toUpperCase() : 'K';
+    const profileName = document.querySelector('.user-card strong'); const profileRole = document.querySelector('.user-card small');
+    if (state.user && profileName) { profileName.textContent = state.user.name; profileRole.textContent = state.user.role === 'admin' ? 'Administrator' : 'Staff'; }
+    $('#recentSales').innerHTML = '<tr><td colspan="6" class="loading">Memuat data transaksi...</td></tr>';
+    try {
+      const data = await run('getInitialData'); state.products = data.products || [];
+      renderDashboard(data); renderProductPage(); renderProducts(); renderPurchasableProducts(data.products || []);
+      renderAdminOverview(data.admin);
+      sessionStorage.setItem('kasirku-user', JSON.stringify(state.user));
+    } catch (error) {
+      toast(error.message, true);
+      if (/Sesi berakhir|akun dinonaktifkan/i.test(error.message)) clearAuth();
+    }
+  }
+
+  function clearAuth() {
+    state.token = ''; state.user = null; localStorage.removeItem('kasirku-token'); sessionStorage.removeItem('kasirku-token'); sessionStorage.removeItem('kasirku-user');
+    document.body.classList.remove('authenticated', 'role-admin');
+  }
+
+  function toggleLoginPassword() {
+    const input = $('#loginPassword'); const button = $('#toggleLoginPassword');
+    const show = input.type === 'password'; input.type = show ? 'text' : 'password';
+    button.innerHTML = '<i class="bi ' + (show ? 'bi-eye-slash' : 'bi-eye') + '"></i>';
+    button.setAttribute('aria-label', show ? 'Sembunyikan kata sandi' : 'Tampilkan kata sandi');
+  }
+
+  function renderDashboard(data) {
+    renderSummary(data.summary); renderSales(data.sales || []); renderLowStock(data.lowStock || []); drawChart($('#salesChart'), data.chart, 'dashboard');
+  }
+
+  function renderSummary(summary = {}) {
+    $('#metricRevenue').textContent = rupiah(summary.revenue);
+    $('#metricTransactions').textContent = Number(summary.transactions || 0).toLocaleString('id-ID');
+    $('#metricAverage').textContent = rupiah(summary.average);
+    const growth = Number(summary.growth || 0); const growthEl = $('#revenueGrowth');
+    growthEl.className = 'trend ' + (growth >= 0 ? 'positive' : 'negative');
+    growthEl.innerHTML = '<i class="bi ' + (growth >= 0 ? 'bi-arrow-up-right' : 'bi-arrow-down-right') + '"></i> ' + Math.abs(growth).toFixed(1) + '%';
+    const low = state.products.filter(product => product.stock <= product.minStock).length;
+    $('#metricStock').innerHTML = low + ' <small>produk</small>';
+  }
+
+  function renderSales(sales) {
+    const body = $('#recentSales');
+    if (!sales.length) { body.innerHTML = '<tr><td colspan="6" class="empty-row">Belum ada transaksi. Mulai transaksi pertamamu di menu Kasir.</td></tr>'; return; }
+    body.innerHTML = sales.map(sale => '<tr><td>' + escapeHtml(sale.id) + '</td><td>' + dateTime(sale.date) + '</td><td>' + escapeHtml(sale.cashier || 'Kasir') + '</td><td>' + escapeHtml(sale.paymentMethod) + '</td><td><strong>' + rupiah(sale.total) + '</strong></td><td><span class="table-status">Selesai</span></td></tr>').join('');
+  }
+
+  function dateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return new Intl.DateTimeFormat('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }).format(date);
+  }
+
+  function renderLowStock(products) {
+    const list = $('#lowStockList');
+    if (!products.length) { list.innerHTML = '<div class="empty-state"><i class="bi bi-check2-circle"></i><strong>Stok aman</strong><span>Belum ada produk yang perlu di-restock.</span></div>'; return; }
+    list.innerHTML = products.slice(0, 5).map((product, index) => '<div class="stock-item"><div class="stock-product-icon"><i class="bi ' + productIcon(index) + '"></i></div><div class="stock-info"><strong>' + escapeHtml(product.name) + '</strong><small>' + escapeHtml(product.category) + '</small></div><span class="stock-level">' + product.stock + ' tersisa</span></div>').join('');
+  }
+
+  function drawChart(element, data, type) {
+    if (!element || !data) return;
+    const old = type === 'dashboard' ? state.chart : state.reportChart;
+    if (old) old.destroy();
+    const chart = new ApexCharts(element, {
+      series: [{ name: 'Penjualan', data: data.values || [] }],
+      chart: { type: 'area', height: 245, toolbar: { show: false }, fontFamily: 'DM Sans, sans-serif', animations: { speed: 350 } },
+      colors: ['#5caa70'], stroke: { curve: 'smooth', width: 2.5 },
+      fill: { type: 'gradient', gradient: { opacityFrom: .22, opacityTo: .015, stops: [0, 95] } },
+      dataLabels: { enabled: false }, grid: { borderColor: '#eff2ee', strokeDashArray: 4, padding: { left: 8, right: 12 } },
+      xaxis: { categories: data.labels || [], labels: { style: { colors: '#97a39a', fontSize: '9px' }, rotate: -35, hideOverlappingLabels: true }, axisBorder: { show: false }, axisTicks: { show: false } },
+      yaxis: { labels: { style: { colors: '#97a39a', fontSize: '9px' }, formatter: value => compactMoney(value) } },
+      tooltip: { y: { formatter: value => rupiah(value) } },
+      noData: { text: 'Belum ada data penjualan', style: { color: '#97a39a', fontSize: '11px' } }
+    });
+    chart.render(); if (type === 'dashboard') state.chart = chart; else state.reportChart = chart;
+  }
+
+  function compactMoney(value) {
+    if (value >= 1000000) return 'Rp' + (value / 1000000).toFixed(1) + 'jt';
+    if (value >= 1000) return 'Rp' + Math.round(value / 1000) + 'rb';
+    return 'Rp' + value;
+  }
+
+  function renderProducts() {
+    const query = ($('#productSearch').value || '').toLowerCase();
+    const category = $('#categoryFilter').value;
+    const products = state.products.filter(product => (product.name.toLowerCase().includes(query) || product.sku.toLowerCase().includes(query)) && (category === 'all' || product.category === category));
+    $('#productGrid').innerHTML = products.length ? products.map((product, index) => '<button class="product-card" data-product="' + escapeHtml(product.id) + '" ' + (product.stock < 1 ? 'disabled' : '') + '><span class="product-thumb"><i class="bi ' + productIcon(index) + '"></i></span><strong>' + escapeHtml(product.name) + '</strong><small>' + escapeHtml(product.category) + ' · ' + escapeHtml(product.sku || 'Tanpa SKU') + '</small><span class="product-card-bottom"><b>' + rupiah(product.price) + '</b><span>Stok ' + product.stock + '</span></span></button>').join('') : '<div class="empty-row">Produk tidak ditemukan.</div>';
+    $('#productGrid').querySelectorAll('[data-product]').forEach(button => button.addEventListener('click', () => addToCart(button.dataset.product)));
+    $('#productsTable').innerHTML = state.products.length ? state.products.map((product, index) => '<tr><td><div class="product-cell"><span class="product-thumb"><i class="bi ' + productIcon(index) + '"></i></span><span><strong>' + escapeHtml(product.name) + '</strong><small>' + escapeHtml(product.id) + '</small></span></div></td><td>' + escapeHtml(product.sku || '—') + '</td><td>' + escapeHtml(product.category) + '</td><td><strong>' + rupiah(product.price) + '</strong></td><td>' + product.stock + '</td><td><span class="stock-badge ' + (product.stock <= product.minStock ? 'low">Menipis' : 'ok">Tersedia') + '</span></td><td><div class="row-actions"><button data-edit="' + escapeHtml(product.id) + '" title="Ubah"><i class="bi bi-pencil"></i></button><button class="delete" data-delete="' + escapeHtml(product.id) + '" title="Hapus"><i class="bi bi-trash3"></i></button></div></td></tr>').join('') : '<tr><td colspan="7" class="empty-row">Belum ada produk.</td></tr>';
+    $('#productsTable').querySelectorAll('[data-edit]').forEach(button => button.addEventListener('click', () => openProductModal(state.products.find(p => p.id === button.dataset.edit))));
+    $('#productsTable').querySelectorAll('[data-delete]').forEach(button => button.addEventListener('click', () => removeProduct(button.dataset.delete)));
+    const canManageProducts = state.user && state.user.role === 'admin';
+    $('#addProductButton').hidden = !canManageProducts;
+    $('#productsTable').querySelectorAll('.row-actions').forEach(actions => { actions.hidden = !canManageProducts; });
+    const categories = [...new Set(state.products.map(product => product.category))];
+    const selected = $('#categoryFilter').value || 'all';
+    $('#categoryFilter').innerHTML = '<option value="all">Semua kategori</option>' + categories.map(item => '<option value="' + escapeHtml(item) + '">' + escapeHtml(item) + '</option>').join('');
+    $('#categoryFilter').value = categories.includes(selected) ? selected : 'all';
+    renderProductPage();
+  }
+
+  function renderPurchasableProducts(products) {
+    $('#purchaseProduct').innerHTML = products.length
+      ? products.map(product => '<option value="' + escapeHtml(product.id) + '">' + escapeHtml(product.name) + ' · stok ' + product.stock + '</option>').join('')
+      : '<option value="">Belum ada produk</option>';
+  }
+
+  function renderProductPage() {
+    $('#totalProducts').textContent = state.products.length;
+    $('#lowProducts').textContent = state.products.filter(p => p.stock <= p.minStock).length;
+    $('#inventoryValue').textContent = rupiah(state.products.reduce((sum, p) => sum + p.price * p.stock, 0));
+    renderLowStock(state.products.filter(p => p.stock <= p.minStock));
+  }
+
+  function addToCart(productId) {
+    const product = state.products.find(item => item.id === productId);
+    if (!product) return;
+    const line = state.cart.find(item => item.productId === productId);
+    if (line && line.qty >= product.stock) { toast('Jumlah melebihi stok yang tersedia.', true); return; }
+    if (line) line.qty += 1; else state.cart.push({ productId, qty: 1 });
+    renderCart();
+  }
+
+  function renderCart() {
+    const box = $('#cartItems');
+    if (!state.cart.length) box.innerHTML = '<div class="empty-state"><i class="bi bi-basket"></i><strong>Keranjang masih kosong</strong><span>Tambahkan produk untuk memulai.</span></div>';
+    else box.innerHTML = state.cart.map(line => {
+      const product = state.products.find(item => item.id === line.productId);
+      return '<div class="cart-line"><span class="product-thumb"><i class="bi ' + productIcon(state.products.indexOf(product)) + '"></i></span><div class="cart-line-info"><strong>' + escapeHtml(product.name) + '</strong><small>' + rupiah(product.price) + '</small></div><div class="qty-control"><button data-qty="' + escapeHtml(product.id) + '" data-delta="-1" aria-label="Kurangi">−</button><span>' + line.qty + '</span><button data-qty="' + escapeHtml(product.id) + '" data-delta="1" aria-label="Tambah">+</button></div></div>';
+    }).join('');
+    box.querySelectorAll('[data-qty]').forEach(button => button.addEventListener('click', () => changeQty(button.dataset.qty, Number(button.dataset.delta))));
+    const count = state.cart.reduce((sum, line) => sum + line.qty, 0);
+    const subtotal = state.cart.reduce((sum, line) => { const product = state.products.find(p => p.id === line.productId); return sum + product.price * line.qty; }, 0);
+    const discount = Math.min(subtotal, Math.max(0, Number($('#discountInput').value || 0)));
+    const total = subtotal - discount;
+    $('#cartCount').textContent = count; $('#cartSubtotal').textContent = rupiah(subtotal); $('#cartTotal').textContent = rupiah(total);
+    $('#changeAmount').textContent = rupiah(Math.max(0, Number($('#paidInput').value || 0) - total));
+  }
+
+  function changeQty(productId, delta) {
+    const line = state.cart.find(item => item.productId === productId);
+    if (!line) return;
+    const product = state.products.find(item => item.id === productId);
+    line.qty += delta;
+    if (line.qty <= 0) state.cart = state.cart.filter(item => item.productId !== productId);
+    else if (line.qty > product.stock) { line.qty = product.stock; toast('Stok maksimal sudah tercapai.', true); }
+    renderCart();
+  }
+
+  async function submitCheckout() {
+    if (!state.cart.length) { toast('Tambahkan produk ke keranjang terlebih dahulu.', true); return; }
+    const button = $('#checkoutButton'); setBusy(button, true);
+    try {
+      const response = await run('checkout', { items: state.cart, discount: Number($('#discountInput').value || 0), paid: Number($('#paidInput').value || 0), paymentMethod: $('#paymentMethod').value, cashier: 'Kasir Toko' });
+      state.products = response.products; state.cart = []; $('#discountInput').value = 0; $('#paidInput').value = '';
+      renderCart(); renderProducts(); renderProductPage(); toast('Transaksi ' + response.transactionId + ' berhasil. Kembalian ' + rupiah(response.change) + '.');
+      refreshDashboard();
+    } catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  }
+
+  async function refreshDashboard() {
+    try { const data = await run('getDashboardData', $('#dashboardPeriod').value); renderSummary(data.summary); renderSales(data.sales); drawChart($('#salesChart'), data.chart, 'dashboard'); renderAdminOverview(data.admin); } catch (error) { toast(error.message, true); }
+  }
+
+  async function loadReport() {
+    $('#topProducts').innerHTML = '<tr><td colspan="4" class="loading">Memuat analisis...</td></tr>';
+    try {
+      const report = await run('getReport', $('#reportPeriod').value);
+      $('#reportRevenue').textContent = rupiah(report.summary.revenue); $('#reportTransactions').textContent = report.summary.transactions;
+      $('#reportAverage').textContent = rupiah(report.summary.average); drawChart($('#reportChart'), report.chart, 'report');
+      $('#topProducts').innerHTML = report.topProducts.length ? report.topProducts.map((product, index) => '<tr><td><span class="rank-cell">#' + (index + 1) + '</span></td><td><strong>' + escapeHtml(product.name) + '</strong></td><td>' + product.qty + ' pcs</td><td><strong>' + rupiah(product.revenue) + '</strong></td></tr>').join('') : '<tr><td colspan="4" class="empty-row">Belum ada penjualan pada periode ini.</td></tr>';
+      const payments = report.paymentMethods || []; const total = payments.reduce((sum, item) => sum + item.total, 0);
+      $('#paymentBreakdown').innerHTML = payments.length ? payments.map((item, index) => '<div class="breakdown-row"><span>' + escapeHtml(item.method) + '</span><strong>' + rupiah(item.total) + '</strong><div class="progress-track"><span style="width:' + (total ? item.total / total * 100 : 0) + '%;background:' + ['#7bad59', '#77a8df', '#e8af58', '#b193d0'][index % 4] + '"></span></div></div>').join('') : '<div class="empty-state"><i class="bi bi-bar-chart"></i><strong>Belum ada data pembayaran</strong></div>';
+      drawPie($('#reportProductPie'), report.topProducts.map(item => ({ name: item.name, value: item.revenue })), 'reportPie');
+      $('#salesStrategies').innerHTML = report.strategy.strategies.map(item => '<div class="strategy-card ' + escapeHtml(item.type) + '"><strong>' + escapeHtml(item.title) + '</strong><p>' + escapeHtml(item.detail) + '</p></div>').join('');
+      $('#forecastRevenue').textContent = rupiah(report.strategy.forecast7Days);
+    } catch (error) { toast(error.message, true); $('#topProducts').innerHTML = '<tr><td colspan="4" class="empty-row">' + escapeHtml(error.message) + '</td></tr>'; }
+  }
+
+  function drawPie(element, items, chartName) {
+    if (!element) return;
+    const old = state[chartName]; if (old) old.destroy();
+    if (!items || !items.length) { state[chartName] = null; element.innerHTML = '<div class="empty-state"><i class="bi bi-pie-chart"></i><strong>Belum ada data</strong><span>Grafik akan muncul setelah ada penjualan.</span></div>'; return; }
+    const chart = new ApexCharts(element, {
+      series: items.map(item => Number(item.value || 0)), labels: items.map(item => item.name),
+      chart: { type: 'donut', height: 220, fontFamily: 'DM Sans, sans-serif' },
+      colors: ['#68a85f', '#9bc86a', '#6f9dcf', '#e4ae58', '#b294d0', '#e27e6c'],
+      dataLabels: { enabled: false }, stroke: { width: 2, colors: ['#fff'] },
+      legend: { position: 'bottom', fontSize: '9px', markers: { width: 7, height: 7 }, itemMargin: { horizontal: 8, vertical: 2 } },
+      tooltip: { y: { formatter: value => rupiah(value) } },
+      plotOptions: { pie: { donut: { size: '66%', labels: { show: true, total: { show: true, label: 'Total', formatter: value => compactMoney(value.globals.seriesTotals.reduce((sum, item) => sum + item, 0)) } } } } }
+    });
+    chart.render(); state[chartName] = chart;
+  }
+
+  function renderAdminOverview(data) {
+    if (!data || !state.user || state.user.role !== 'admin') return;
+    renderSessions(data.activeSessions || []); renderActivities($('#dashboardActivity'), data.activities || []);
+    drawPie($('#productPie'), data.productMix || [], 'productPie');
+    drawPie($('#paymentPie'), (data.paymentMethods || []).map(item => ({ name: item.method, value: item.total })), 'paymentPie');
+    renderPurchases($('#myPurchases'), (data.purchases || []).filter(item => item.staff === state.user.name).slice(0, 6));
+  }
+
+  function renderSessions(sessions) {
+    $('#activeSessions').innerHTML = sessions.length ? sessions.map(session => '<div class="session-row"><span class="session-avatar">' + escapeHtml(session.name.slice(0, 1).toUpperCase()) + '</span><div class="session-info"><strong>' + escapeHtml(session.name) + ' <small>(' + escapeHtml(session.role) + ')</small></strong><small>@' + escapeHtml(session.username) + ' · aktif ' + dateTime(session.lastSeen) + '</small></div><span class="table-status">Aktif</span></div>').join('') : '<div class="empty-state"><i class="bi bi-person-slash"></i><strong>Tidak ada sesi aktif</strong><span>Sesi akan terlihat saat staff beraktivitas.</span></div>';
+  }
+
+  function renderActivities(container, activities) {
+    if (!container) return;
+    container.innerHTML = activities.length ? activities.map(item => '<div class="activity-row"><span class="session-avatar"><i class="bi ' + (item.activity === 'Penjualan' ? 'bi-receipt' : item.activity.includes('stok') || item.activity.includes('Pembelian') ? 'bi-box-arrow-in-down' : 'bi-person-gear') + '"></i></span><div class="activity-copy"><strong>' + escapeHtml(item.activity) + ' · ' + escapeHtml(item.name) + '</strong><small>' + escapeHtml(item.detail) + ' · ' + dateTime(item.date) + '</small></div>' + (item.amount ? '<span class="activity-value">' + rupiah(item.amount) + '</span>' : '') + '</div>').join('') : '<div class="empty-state"><i class="bi bi-clock-history"></i><strong>Belum ada aktivitas</strong></div>';
+  }
+
+  function renderPurchases(container, purchases) {
+    if (!container) return;
+    container.innerHTML = purchases.length ? purchases.map(item => '<div class="activity-row"><span class="session-avatar"><i class="bi bi-box-seam"></i></span><div class="activity-copy"><strong>' + escapeHtml(item.product) + ' +' + item.qty + ' unit</strong><small>' + escapeHtml(item.staff) + ' · ' + escapeHtml(item.supplier || 'Pemasok tidak dicatat') + ' · ' + dateTime(item.date) + '</small></div><span class="activity-value">' + rupiah(item.total) + '</span></div>').join('') : '<div class="empty-state"><i class="bi bi-box"></i><strong>Belum ada pembelian stok</strong></div>';
+  }
+
+  async function loadMonitor() {
+    try {
+      const data = await run('getAdminOverview', $('#monitorPeriod').value);
+      $('#monitorSessions').textContent = data.activeSessions.length;
+      $('#monitorPurchaseCount').textContent = data.purchaseCount;
+      $('#monitorPurchaseValue').textContent = rupiah(data.purchaseValue);
+      $('#monitorActivity').innerHTML = data.activities.length ? data.activities.map(item => '<tr><td>' + dateTime(item.date) + '</td><td>' + escapeHtml(item.name) + '</td><td><span class="table-status">' + escapeHtml(item.activity) + '</span></td><td>' + escapeHtml(item.detail) + '</td><td><strong>' + (item.amount ? rupiah(item.amount) : '—') + '</strong></td></tr>').join('') : '<tr><td colspan="5" class="empty-row">Belum ada aktivitas untuk periode ini.</td></tr>';
+      $('#monitorPurchases').innerHTML = data.purchases.length ? data.purchases.map(item => '<tr><td>' + dateTime(item.date) + '</td><td>' + escapeHtml(item.staff) + '</td><td><strong>' + escapeHtml(item.product) + '</strong></td><td>' + item.qty + ' unit</td><td>' + rupiah(item.cost) + '</td><td>' + escapeHtml(item.supplier || '—') + '</td></tr>').join('') : '<tr><td colspan="6" class="empty-row">Belum ada pembelian stok tercatat.</td></tr>';
+    } catch (error) { toast(error.message, true); }
+  }
+
+  async function loadStaff() {
+    try {
+      const staff = await run('getStaff');
+      $('#staffTable').innerHTML = staff.map(person => '<tr><td><strong>' + escapeHtml(person.name) + '</strong></td><td>' + escapeHtml(person.username) + '</td><td><span class="role-chip">' + escapeHtml(person.role) + '</span></td><td><span class="stock-badge ' + (person.status === 'Aktif' ? 'ok">Aktif' : 'low">Nonaktif') + '</span></td><td><div class="row-actions"><button data-staff-edit="' + escapeHtml(person.id) + '" title="Ubah"><i class="bi bi-pencil"></i></button><button data-staff-reset="' + escapeHtml(person.id) + '" title="Reset password"><i class="bi bi-key"></i></button></div></td></tr>').join('');
+      $('#staffTable').querySelectorAll('[data-staff-edit]').forEach(button => button.addEventListener('click', () => openStaffModal(staff.find(person => person.id === button.dataset.staffEdit))));
+      $('#staffTable').querySelectorAll('[data-staff-reset]').forEach(button => button.addEventListener('click', () => resetStaffPassword(staff.find(person => person.id === button.dataset.staffReset))));
+    } catch (error) { toast(error.message, true); }
+  }
+
+  function openStaffModal(person) {
+    const form = $('#staffForm'); form.reset(); form.elements.id.value = person ? person.id : '';
+    form.elements.password.required = !person;
+    if (person) ['name', 'username', 'role', 'status'].forEach(key => { form.elements[key].value = person[key]; });
+    $('#newStaffPasswordLabel').hidden = Boolean(person);
+    $('#staffModalTitle').textContent = person ? 'Ubah data staff' : 'Tambah staff';
+    $('#staffModal').classList.add('open'); $('#staffModal').setAttribute('aria-hidden', 'false');
+  }
+
+  async function saveStaff(event) {
+    event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('[type="submit"]'); setBusy(button, true);
+    const staff = Object.fromEntries(new FormData(form).entries());
+    try {
+      const result = await run('saveStaff', staff); closeModal('staffModal'); await loadStaff();
+      if (result.temporaryPassword) window.alert('Akun dibuat. Sampaikan password sementara ini kepada staff dengan aman: ' + result.temporaryPassword);
+      else toast('Data staff berhasil disimpan.');
+    } catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  }
+
+  async function resetStaffPassword(person) {
+    if (!person) return;
+    const password = window.prompt('Masukkan password baru untuk ' + person.name + ' (minimal 8 karakter):');
+    if (password === null) return;
+    try { await run('resetStaffPassword', person.id, password); toast('Password direset. Sesi staff tersebut sudah dicabut.'); }
+    catch (error) { toast(error.message, true); }
+  }
+
+  async function recordPurchase(event) {
+    event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('[type="submit"]'); setBusy(button, true);
+    const values = Object.fromEntries(new FormData(form).entries());
+    try {
+      const result = await run('recordStockPurchase', { items: [{ productId: values.productId, qty: values.qty, cost: values.cost }], supplier: values.supplier, note: values.note });
+      state.products = result.products; renderProducts(); renderProductPage(); renderPurchasableProducts(state.products); form.reset(); toast('Pembelian ' + result.purchaseId + ' tersimpan dan stok diperbarui.');
+      if (state.user.role === 'admin') renderAdminOverview(await run('getAdminOverview', $('#dashboardPeriod').value));
+      else await loadMyPurchases();
+    } catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  }
+
+  async function changePassword(event) {
+    event.preventDefault(); const form = event.currentTarget; const values = Object.fromEntries(new FormData(form).entries());
+    try { await run('changeMyPassword', values.currentPassword, values.newPassword); form.reset(); closeModal('passwordModal'); clearAuth(); toast('Password diperbarui. Silakan masuk kembali.'); }
+    catch (error) { toast(error.message, true); }
+  }
+
+  async function logout() {
+    try { await run('logout'); } catch (error) { /* sesi yang kedaluwarsa tetap dapat dihapus dari browser */ }
+    state.cart = []; clearAuth();
+  }
+
+  function closeModal(id) { $('#' + id).classList.remove('open'); $('#' + id).setAttribute('aria-hidden', 'true'); }
+
+  function navigate(page) {
+    if (['reports', 'staff', 'monitor'].includes(page) && (!state.user || state.user.role !== 'admin')) {
+      toast('Menu ini hanya tersedia untuk admin.', true);
+      return;
+    }
+    state.page = page;
+    document.querySelectorAll('.page').forEach(section => section.classList.toggle('active', section.id === 'page-' + page));
+    document.querySelectorAll('.nav-link').forEach(button => button.classList.toggle('active', button.dataset.page === page));
+    const names = { dashboard: 'Ringkasan', pos: 'Kasir', products: 'Produk', reports: 'Laporan', stock: 'Tambah stok', staff: 'Kelola staff', monitor: 'Log pemantauan' };
+    $('#pageCrumb').textContent = names[page] || names.dashboard; $('#sidebar').classList.remove('open');
+    if (page === 'reports') loadReport();
+    if (page === 'pos') renderProducts();
+    if (page === 'staff') loadStaff();
+    if (page === 'monitor') loadMonitor();
+    if (page === 'stock') loadMyPurchases();
+  }
+
+  async function loadMyPurchases() {
+    try { renderPurchases($('#myPurchases'), await run('getMyPurchases')); }
+    catch (error) { toast(error.message, true); }
+  }
+
+  function openProductModal(product) {
+    const form = $('#productForm'); form.reset(); form.elements.id.value = product ? product.id : '';
+    if (product) Object.keys(product).forEach(key => { if (form.elements[key]) form.elements[key].value = product[key]; });
+    $('#productModalTitle').textContent = product ? 'Ubah produk' : 'Tambah produk'; $('#productModal').classList.add('open'); $('#productModal').setAttribute('aria-hidden', 'false');
+  }
+
+  function closeProductModal() { $('#productModal').classList.remove('open'); $('#productModal').setAttribute('aria-hidden', 'true'); }
+
+  async function saveProduct(event) {
+    event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('[type="submit"]'); setBusy(button, true);
+    const product = Object.fromEntries(new FormData(form).entries());
+    try { const response = await run('saveProduct', product); state.products = response.products; renderProducts(); closeProductModal(); toast('Produk berhasil disimpan.'); }
+    catch (error) { toast(error.message, true); }
+    finally { setBusy(button, false); }
+  }
+
+  async function removeProduct(productId) {
+    const product = state.products.find(item => item.id === productId);
+    if (!product || !window.confirm('Hapus produk "' + product.name + '" dari katalog?')) return;
+    try { const response = await run('deleteProduct', productId); state.products = response.products; state.cart = state.cart.filter(line => line.productId !== productId); renderProducts(); renderCart(); toast('Produk berhasil dihapus.'); }
+    catch (error) { toast(error.message, true); }
+  }
+
+  function bindEvents() {
+    document.querySelectorAll('.nav-link').forEach(button => button.addEventListener('click', () => navigate(button.dataset.page)));
+    document.querySelectorAll('[data-go]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.go)));
+    $('#mobileMenu').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
+    $('#dashboardPeriod').addEventListener('change', refreshDashboard);
+    $('#reportPeriod').addEventListener('change', loadReport);
+    $('#productSearch').addEventListener('input', renderProducts); $('#categoryFilter').addEventListener('change', renderProducts);
+    $('#inventorySearch').addEventListener('input', () => {
+      const query = $('#inventorySearch').value.toLowerCase();
+      $('#productsTable').querySelectorAll('tr').forEach(row => { row.hidden = !row.textContent.toLowerCase().includes(query); });
+    });
+    $('#discountInput').addEventListener('input', renderCart); $('#paidInput').addEventListener('input', renderCart);
+    $('#clearCart').addEventListener('click', () => { state.cart = []; renderCart(); });
+    $('#checkoutButton').addEventListener('click', submitCheckout);
+    $('#addProductButton').addEventListener('click', () => openProductModal());
+    $('#productForm').addEventListener('submit', saveProduct);
+    $('#closeProductModal').addEventListener('click', closeProductModal); $('#cancelProductModal').addEventListener('click', closeProductModal);
+    $('#productModal').addEventListener('click', event => { if (event.target === $('#productModal')) closeProductModal(); });
+    $('#monitorPeriod').addEventListener('change', loadMonitor);
+    $('#addStaffButton').addEventListener('click', () => openStaffModal());
+    $('#staffForm').addEventListener('submit', saveStaff);
+    $('#closeStaffModal').addEventListener('click', () => closeModal('staffModal'));
+    $('#cancelStaffModal').addEventListener('click', () => closeModal('staffModal'));
+    $('#staffModal').addEventListener('click', event => { if (event.target === $('#staffModal')) closeModal('staffModal'); });
+    $('#stockPurchaseForm').addEventListener('submit', recordPurchase);
+    $('#logoutButton').addEventListener('click', logout);
+    $('#changePasswordButton').addEventListener('click', () => { $('#passwordModal').classList.add('open'); $('#passwordModal').setAttribute('aria-hidden', 'false'); });
+    $('#passwordForm').addEventListener('submit', changePassword);
+    $('#closePasswordModal').addEventListener('click', () => closeModal('passwordModal'));
+    $('#cancelPasswordModal').addEventListener('click', () => closeModal('passwordModal'));
+    $('#passwordModal').addEventListener('click', event => { if (event.target === $('#passwordModal')) closeModal('passwordModal'); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') ['productModal', 'staffModal', 'passwordModal'].forEach(closeModal); });
+  }
+
+  document.addEventListener('DOMContentLoaded', initialize);
+})();
+</script>
